@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-基金观察 · 微信估值快报推送脚本（精简版）
+基金观察 · 微信估值快报推送脚本（v3：北京时间 + 盈亏合计 + 排版优化）
 ==========================================
-推送内容：基金名称 / 今日上涨比例 / 预估盈亏(元) / 规模(亿)
+推送内容：持仓/行业 名称 + 今日涨跌% + 预估盈亏 + 规模 + 今日合计 + 总盈亏
 
 使用：
   1. 微信扫码注册 https://www.pushplus.plus/ 获取 token
   2. 设置环境变量 PUSHPLUS_TOKEN=<token> 或 --token 参数
   3. 运行：python push_wechat.py
+     常驻调度：python push_wechat.py --token xxxx --schedule
 
-调度：GitHub Actions（.github/workflows/hourly.yml）每小时自动跑，
-      或本地 启动微信推送.bat 每小时循环。
+调度：
+  - GitHub Actions（.github/workflows/hourly.yml）：交易时段每小时，注意是 UTC，
+    脚本内部已统一用北京时间显示
+  - 本地 Windows 计划任务：安装定时推送.bat
 """
 import json
 import os
@@ -18,21 +21,24 @@ import re
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+# 北京时间（脚本运行在 GitHub Actions 时是 UTC，必须显式转北京）
+BEIJING = timezone(timedelta(hours=8))
 
 # ============================================================
-#  配置：持仓（amount=当前持有金额，用于算预估盈亏）
+#  配置：持仓（amount=当前持有金额，cost=买入成本）
 #        etf=场内对应ETF(盘中估算用)，None=用持仓加权
 # ============================================================
 HOLDINGS = [
-    {'code': '501058', 'name': '新能源车C', 'etf': '515030', 'amount': 10383},
-    {'code': '023639', 'name': '电网设备C', 'etf': '159320', 'amount': 9286},
-    {'code': '004997', 'name': '高端制造A', 'etf': None,    'amount': 5708},
-    {'code': '020973', 'name': '机器人C',   'etf': '159530', 'amount': 4901},
-    {'code': '007300', 'name': '半导体A',   'etf': '512480', 'amount': 4441},
-    {'code': '027676', 'name': '科创50C',   'etf': '588000', 'amount': 907},
-    {'code': '004042', 'name': '华夏鼎茂债', 'etf': None,    'amount': 150000},
-    {'code': '003039', 'name': '广发集富债', 'etf': None,    'amount': 50000},
+    {'code': '501058', 'name': '新能源车C', 'etf': '515030', 'amount': 10383, 'cost': 10000},
+    {'code': '023639', 'name': '电网设备C', 'etf': '159320', 'amount': 9286,  'cost': 10000},
+    {'code': '004997', 'name': '高端制造A', 'etf': None,    'amount': 5708,  'cost': 10000},
+    {'code': '020973', 'name': '机器人C',   'etf': '159530', 'amount': 4901,  'cost': 5000},
+    {'code': '007300', 'name': '半导体A',   'etf': '512480', 'amount': 4441,  'cost': 5000},
+    {'code': '027676', 'name': '科创50C',   'etf': '588000', 'amount': 907,   'cost': 1000},
+    {'code': '004042', 'name': '华夏鼎茂债', 'etf': None,    'amount': 150000, 'cost': 150000},
+    {'code': '003039', 'name': '广发集富债', 'etf': None,    'amount': 50000,  'cost': 50000},
 ]
 
 SECTORS = [
@@ -53,6 +59,7 @@ BOND_CODES = {'004042', '003039'}
 
 PUSHPLUS_URL = 'https://www.pushplus.plus/send'
 UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+SEP = '━━━━━━━━━━━━━━'
 
 
 def secid_of(code):
@@ -67,7 +74,7 @@ def http_get(url, headers=None, timeout=12):
 
 
 def fetch_quotes(secids):
-    """批量行情：先试腾讯（更稳定），失败再试 push2。返回 {secid: {ret, name}}"""
+    """批量行情：先试腾讯（更稳定），失败再试 push2"""
     out = fetch_quotes_tencent(secids)
     if out:
         return out
@@ -75,8 +82,7 @@ def fetch_quotes(secids):
 
 
 def fetch_quotes_tencent(secids):
-    """腾讯行情（qt.gtimg.cn）：批量、稳定、无Referer限制。
-    返回格式 v_sh512480="1~名称~代码~现价~昨收~...~涨跌~涨跌幅%~..."，涨跌幅在字段[32]"""
+    """腾讯行情（qt.gtimg.cn），涨跌幅在字段[32]"""
     out = {}
     codes = []
     for s in secids:
@@ -141,7 +147,7 @@ def fetch_quotes_push2(secids):
 
 
 def fetch_holding(code):
-    """主动基金前10大持仓（服务器端补 Referer）"""
+    """主动基金前10大持仓"""
     url = 'https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code={}&topline=10'.format(code)
     try:
         raw = http_get(url, headers={
@@ -174,7 +180,7 @@ def fetch_holding(code):
 
 
 def fetch_fund_scale(code):
-    """基金规模（亿元）：pingzhongdata 的 Data_fluctuationScale 最新一期"""
+    """基金规模（亿元）"""
     url = 'https://fund.eastmoney.com/pingzhongdata/{}.js'.format(code)
     try:
         text = http_get(url, timeout=15)
@@ -190,11 +196,25 @@ def fetch_fund_scale(code):
     return None
 
 
-def build_message():
-    now = datetime.now().strftime('%H:%M')
-    lines = ['📊 基金观察 {}'.format(now)]
+def fmt_pct(ret, nd=2):
+    if ret is None:
+        return '   --  '
+    sign = '+' if ret >= 0 else '-'
+    return '{}{:.{}f}%'.format(sign, abs(ret), nd)
 
-    # ---------- 1. 批量收集行情（2 个请求以内） ----------
+
+def fmt_money(v):
+    if v is None:
+        return '   --  '
+    return '{}{:.0f}元'.format('+' if v >= 0 else '', v)
+
+
+def build_message():
+    now = datetime.now(BEIJING)
+    lines = ['📊 基金观察 · {}'.format(now.strftime('%H:%M'))]
+    lines.append(SEP)
+
+    # ---------- 1. 批量收集行情 ----------
     etf_secids = [secid_of(f['etf']) for f in HOLDINGS + SECTORS if f.get('etf')]
     quotes = fetch_quotes(list(set(etf_secids)))
 
@@ -209,7 +229,7 @@ def build_message():
     if extra_secids:
         quotes.update(fetch_quotes(list(set(extra_secids))))
 
-    # ---------- 2. 规模（每只基金，串行 + 小间隔） ----------
+    # ---------- 2. 规模 ----------
     scales = {}
     for f in HOLDINGS + SECTORS:
         s = fetch_fund_scale(f['code'])
@@ -236,39 +256,50 @@ def build_message():
                 return sr / sw
         return None
 
-    # ---------- 4. 组装消息 ----------
-    lines.append('━━━━━━━━━━━━')
-    lines.append('【我的持仓】')
+    # ---------- 4. 组装：持仓 ----------
+    lines.append('【持仓 · 今日预估】')
+    sum_today = 0.0
+    sum_total = 0.0
     for f in HOLDINGS:
         ret = est(f)
         scale = scales.get(f['code'])
         scale_txt = '{}亿'.format(int(round(scale))) if scale else '--'
+        amt = f.get('amount')
+        cost = f.get('cost')
+
+        today = None
+        if ret is not None and amt:
+            today = amt - amt / (1 + ret / 100)
+            sum_today += today
+        if amt and cost:
+            sum_total += (amt - cost)
+
         if ret is None:
-            # 债基：无涨跌，仅规模
-            lines.append('  {}  {}'.format(f['name'], scale_txt))
+            lines.append('   {}  {}'.format(f['name'], scale_txt))
         else:
             arrow = '🔴' if ret >= 0 else '🟢'
-            pct = '{}{:.2f}%'.format('+' if ret >= 0 else '', ret)
-            # 预估盈亏（基于持有金额）
-            amt = f.get('amount')
-            if amt and ret != 0:
-                pnl = amt - amt / (1 + ret / 100)
-                pnl_txt = '{}{:.0f}元'.format('+' if pnl >= 0 else '', pnl)
-            else:
-                pnl_txt = '--'
-            lines.append('  {}{}  {}  {}  {}'.format(arrow, f['name'], pct, pnl_txt, scale_txt))
+            lines.append('  {}{:<7} {}  {}  {}'.format(arrow, f['name'], fmt_pct(ret), fmt_money(today), scale_txt))
 
-    lines.append('━━━━━━━━━━━━')
+    # ---------- 5. 合计 ----------
+    lines.append(SEP)
+    lines.append('💰 今日合计：{}'.format(fmt_money(sum_today)))
+    lines.append('📈 持仓总盈亏：{}'.format(fmt_money(sum_total)))
+    lines.append(SEP)
+
+    # ---------- 6. 行业观察 ----------
     lines.append('【行业观察】')
     for s in SECTORS:
         ret = est(s)
         scale = scales.get(s['code'])
         scale_txt = '{}亿'.format(int(round(scale))) if scale else '--'
-        pct = '{}{:.1f}%'.format('+' if ret is not None and ret >= 0 else '', ret if ret is not None else 0)
-        lines.append('  {}  {}  {}'.format(s['name'], pct, scale_txt))
+        if ret is None:
+            lines.append('  {}  {}'.format(s['name'], scale_txt))
+        else:
+            arrow = '🔴' if ret >= 0 else '🟢'
+            lines.append('  {}{:<6} {}  {}'.format(arrow, s['name'], fmt_pct(ret, 1), scale_txt))
 
-    lines.append('━━━━━━━━━━━━')
-    lines.append('⚠️ 盘中估算，以官方净值为准')
+    lines.append(SEP)
+    lines.append('⚠️ 盘中估算 · 仅供参考 · 以官方净值为准')
     return '\n'.join(lines)
 
 
@@ -282,15 +313,13 @@ def push_wechat(token, title, content):
 
 
 def schedule_loop(token):
-    """常驻模式：周一至周五，交易时段每小时推送一次。
-    发送时间点：9:30 / 10:30 / 11:30 / 13:30 / 14:30 / 15:30"""
+    """常驻模式：周一至周五 9:30/10:30/11:30/13:30/14:30/15:30"""
     times = [(9, 30), (10, 30), (11, 30), (13, 30), (14, 30), (15, 30)]
-    last_push = None  # 记录 (日期, 时间点)，避免同一分钟重复推送
+    last_push = None
     print('⏰ 常驻调度已启动：周一至周五 9:30/10:30/11:30/13:30/14:30/15:30 推送')
-    print('   保持本窗口开启，关闭即停止。')
     while True:
-        now = datetime.now()
-        if now.weekday() < 5:  # 周一~周五（0-4）
+        now = datetime.now(BEIJING)
+        if now.weekday() < 5:
             hm = (now.hour, now.minute)
             if hm in times and (now.date(), hm) != last_push:
                 last_push = (now.date(), hm)
@@ -305,7 +334,6 @@ def schedule_loop(token):
 
 
 def main():
-    # Windows 控制台 GBK 编码无法显示 emoji，统一用 UTF-8 输出避免报错
     try:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
@@ -327,7 +355,7 @@ def main():
         content = build_message()
     except Exception as e:
         content = '📊 基金观察快报\n抓取失败：{}\n请检查网络'.format(e)
-    title = '📊 基金估值 {}'.format(datetime.now().strftime('%H:%M'))
+    title = '📊 基金估值 {}'.format(datetime.now(BEIJING).strftime('%H:%M'))
     ok = push_wechat(token, title, content)
     if ok:
         print('✅ 已发送到微信')
