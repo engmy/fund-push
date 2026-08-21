@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-基金观察 · 微信估值快报推送脚本（v3：北京时间 + 盈亏合计 + 排版优化）
+基金观察 · 微信估值快报推送脚本（v4：份额制，每日自动更新市值）
 ==========================================
+核心改进：配置里存【份额】(shares)，每天自动抓最新净值计算市值，
+         市值 = 份额 × 当日净值（自动更新），盈亏每天准确。
+         只有你【买卖基金】时才需要更新份额。
+
 推送内容：持仓/行业 名称 + 今日涨跌% + 预估盈亏 + 规模 + 今日合计 + 总盈亏
 
 使用：
@@ -9,11 +13,6 @@
   2. 设置环境变量 PUSHPLUS_TOKEN=<token> 或 --token 参数
   3. 运行：python push_wechat.py
      常驻调度：python push_wechat.py --token xxxx --schedule
-
-调度：
-  - GitHub Actions（.github/workflows/hourly.yml）：交易时段每小时，注意是 UTC，
-    脚本内部已统一用北京时间显示
-  - 本地 Windows 计划任务：安装定时推送.bat
 """
 import json
 import os
@@ -23,22 +22,21 @@ import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-# 北京时间（脚本运行在 GitHub Actions 时是 UTC，必须显式转北京）
+# 北京时间（GitHub Actions 是 UTC，必须显式转北京）
 BEIJING = timezone(timedelta(hours=8))
 
 # ============================================================
-#  配置：持仓（amount=当前持有金额，cost=买入成本）
-#        etf=场内对应ETF(盘中估算用)，None=用持仓加权
+#  配置：持仓（shares=持有份额，cost=买入成本，etf=场内对应ETF）
+#  ★ 份额来自你 8/20 的平台金额 ÷ 官方净值推算
+#  ★ 以后买卖基金后，把份额更新成理财通显示的"持有份额"
 # ============================================================
 HOLDINGS = [
-    {'code': '501058', 'name': '新能源车C', 'etf': '515030', 'amount': 10383, 'cost': 10000},
-    {'code': '023639', 'name': '电网设备C', 'etf': '159320', 'amount': 9286,  'cost': 10000},
-    {'code': '004997', 'name': '高端制造A', 'etf': None,    'amount': 5708,  'cost': 10000},
-    {'code': '020973', 'name': '机器人C',   'etf': '159530', 'amount': 4901,  'cost': 5000},
-    {'code': '007300', 'name': '半导体A',   'etf': '512480', 'amount': 4441,  'cost': 5000},
-    {'code': '027676', 'name': '科创50C',   'etf': '588000', 'amount': 907,   'cost': 1000},
-    {'code': '004042', 'name': '华夏鼎茂债', 'etf': None,    'amount': 150000, 'cost': 150000},
-    {'code': '003039', 'name': '广发集富债', 'etf': None,    'amount': 50000,  'cost': 50000},
+    {'code': '501058', 'name': '新能源车C', 'etf': '515030', 'shares': 4911.11, 'cost': 10000},
+    {'code': '023639', 'name': '电网设备C', 'etf': '159320', 'shares': 5343.36, 'cost': 10000},
+    {'code': '004997', 'name': '高端制造A', 'etf': None,    'shares': 4058.58, 'cost': 10000},
+    {'code': '020973', 'name': '机器人C',   'etf': '159530', 'shares': 3793.12, 'cost': 5000},
+    {'code': '007300', 'name': '半导体A',   'etf': '512480', 'shares': 1102.45, 'cost': 5000},
+    {'code': '027676', 'name': '科创50C',   'etf': '588000', 'shares': 1000.04, 'cost': 1000.04},
 ]
 
 SECTORS = [
@@ -54,8 +52,8 @@ SECTORS = [
     {'code': '012728', 'name': '游戏',     'etf': '159869'},
 ]
 
-# 纯债基金：不估算涨跌，只显示规模
-BOND_CODES = {'004042', '003039'}
+# 纯债基金：不估算涨跌，只显示市值/规模（当前无债基持仓）
+BOND_CODES = set()
 
 PUSHPLUS_URL = 'https://www.pushplus.plus/send'
 UA = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -74,7 +72,6 @@ def http_get(url, headers=None, timeout=12):
 
 
 def fetch_quotes(secids):
-    """批量行情：先试腾讯（更稳定），失败再试 push2"""
     out = fetch_quotes_tencent(secids)
     if out:
         return out
@@ -82,7 +79,7 @@ def fetch_quotes(secids):
 
 
 def fetch_quotes_tencent(secids):
-    """腾讯行情（qt.gtimg.cn），涨跌幅在字段[32]"""
+    """腾讯行情，涨跌幅在字段[32]"""
     out = {}
     codes = []
     for s in secids:
@@ -179,21 +176,33 @@ def fetch_holding(code):
     return holdings
 
 
-def fetch_fund_scale(code):
-    """基金规模（亿元）"""
+def fetch_fund_data(code):
+    """抓 pingzhongdata，返回 {'nav': 最新净值, 'scale': 规模亿}。失败返回 None"""
     url = 'https://fund.eastmoney.com/pingzhongdata/{}.js'.format(code)
     try:
         text = http_get(url, timeout=15)
-        m = re.search(r'Data_fluctuationScale\s*=\s*(\{.*?\});', text, re.S)
-        if m:
-            o = json.loads(m.group(1))
+    except Exception:
+        return None
+    out = {}
+    m = re.search(r'Data_netWorthTrend\s*=\s*(\[.*?\]);', text, re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(1))
+            if arr:
+                out['nav'] = float(arr[-1].get('y'))
+        except Exception:
+            pass
+    m2 = re.search(r'Data_fluctuationScale\s*=\s*(\{.*?\});', text, re.S)
+    if m2:
+        try:
+            o = json.loads(m2.group(1))
             if o.get('series') and o['series']:
                 y = o['series'][-1].get('y')
                 if y is not None:
-                    return float(y)
-    except Exception:
-        pass
-    return None
+                    out['scale'] = float(y)
+        except Exception:
+            pass
+    return out if out else None
 
 
 def fmt_pct(ret, nd=2):
@@ -214,7 +223,7 @@ def build_message():
     lines = ['📊 基金观察 · {}'.format(now.strftime('%H:%M'))]
     lines.append(SEP)
 
-    # ---------- 1. 批量收集行情 ----------
+    # ---------- 1. 行情 ----------
     etf_secids = [secid_of(f['etf']) for f in HOLDINGS + SECTORS if f.get('etf')]
     quotes = fetch_quotes(list(set(etf_secids)))
 
@@ -229,12 +238,12 @@ def build_message():
     if extra_secids:
         quotes.update(fetch_quotes(list(set(extra_secids))))
 
-    # ---------- 2. 规模 ----------
-    scales = {}
+    # ---------- 2. 净值 + 规模（每只一次 pingzhongdata） ----------
+    fund_data = {}
     for f in HOLDINGS + SECTORS:
-        s = fetch_fund_scale(f['code'])
-        if s:
-            scales[f['code']] = s
+        d = fetch_fund_data(f['code'])
+        if d:
+            fund_data[f['code']] = d
         time.sleep(0.15)
 
     # ---------- 3. 估算涨跌 ----------
@@ -256,26 +265,29 @@ def build_message():
                 return sr / sw
         return None
 
-    # ---------- 4. 组装：持仓 ----------
+    # ---------- 4. 持仓区 ----------
     lines.append('【持仓 · 今日预估】')
     sum_today = 0.0
     sum_total = 0.0
     for f in HOLDINGS:
         ret = est(f)
-        scale = scales.get(f['code'])
-        scale_txt = '{}亿'.format(int(round(scale))) if scale else '--'
-        amt = f.get('amount')
+        d = fund_data.get(f['code'], {})
+        nav = d.get('nav')
+        scale_txt = '{}亿'.format(int(round(d['scale']))) if d.get('scale') else '--'
+        shares = f.get('shares')
         cost = f.get('cost')
+        # 市值 = 份额 × 当日净值（自动更新）
+        amt = shares * nav if shares and nav else None
 
         today = None
         if ret is not None and amt:
             today = amt - amt / (1 + ret / 100)
             sum_today += today
-        if amt and cost:
+        if amt is not None and cost:
             sum_total += (amt - cost)
 
         if ret is None:
-            lines.append('   {}  {}'.format(f['name'], scale_txt))
+            lines.append('   {:<7} {}'.format(f['name'], scale_txt))
         else:
             arrow = '🔴' if ret >= 0 else '🟢'
             lines.append('  {}{:<7} {}  {}  {}'.format(arrow, f['name'], fmt_pct(ret), fmt_money(today), scale_txt))
@@ -290,10 +302,10 @@ def build_message():
     lines.append('【行业观察】')
     for s in SECTORS:
         ret = est(s)
-        scale = scales.get(s['code'])
-        scale_txt = '{}亿'.format(int(round(scale))) if scale else '--'
+        d = fund_data.get(s['code'], {})
+        scale_txt = '{}亿'.format(int(round(d['scale']))) if d.get('scale') else '--'
         if ret is None:
-            lines.append('  {}  {}'.format(s['name'], scale_txt))
+            lines.append('  {:<6} {}'.format(s['name'], scale_txt))
         else:
             arrow = '🔴' if ret >= 0 else '🟢'
             lines.append('  {}{:<6} {}  {}'.format(arrow, s['name'], fmt_pct(ret, 1), scale_txt))
